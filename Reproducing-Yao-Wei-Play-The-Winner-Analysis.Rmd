@@ -1,0 +1,562 @@
+---
+title: "Reproducing Yao & Wei Play The Winner Analysis"
+author: "Hafiz Khusyairi"
+date: "23/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+### Purpose
+
+Yao & Wei published a paper titled "PLAY THE WINNER FOR PHASE II/III CLINICAL TRIALS" in 1996. In this article, they simulated various adaptations of their adaptive Play The Winner Randomisation method using data from two clinical trials. Using the simulations, they illustrated that using adaptive randomisation can place more patients in the better arm of the study without losing much statistical power. Play The Winner designs can be especially useful if receiving the worse treatment in a trial is potentially fatal. While Yao & Wei outlined their simulations approach in their paper, deriving the algorithm from this outline is not obvious, and this might make it harder to perform a similar analysis on other studies. To fill in this gap, I will try to reproduce some of their results using the statistical package R.
+
+### Play The Winner Design
+
+The simplest Randomised Play The Winner Design RPW($u,\alpha,\beta$) is defined as follows. Suppose we have two treatments, A and B. Then at the start of the study, we start with an urn with $u$ numbers of balls marked A and $u$ numbers of balls marked B. When a patient enters the study, we sample from the urn with replacement and assign the patient to the treatment marked on the ball. When the response of a patient is known, we add balls to the urn based on the success or failure status of the response that we defined beforehand. If the response is a success, we add $\alpha$ balls for the associated treatment; if it is a failure, then we add $\beta$ balls to the other treatment.
+
+To ease the administrative burden of the study, we can update the urn only at some time points. For example, in a multi-year study, these time-points could be the start of every new year. This rule is named Multi-Stage Play The Winner design.
+
+Another type of Multi-Stage Play The Winner design described in the study uses relevant statistics calculated in the study instead of success or failure that may be hard to define or measure. The authors used the example of Gehan statistic G that compare two survival curves. For example, at every time point chosen, we calculate the statistic G of the available data. A large value of G may indicate that treatment A is better than treatment B. In this case, we update the probability of assigning treatment A to $0.5+G \times r$ for some tuning parameter $r$. The bigger the parameter $r$, the more the design favours the one perceived as the better treatment. The authors also restrict the updated probability to be between 0.1 and 0.9.
+
+## The Data
+
+There were two studies discussed in the paper. The first is from AIDS Clinical Trial Group 076 (ACTG 076), and the second one was the long term prostatic cancer trial conducted by the Veterans Administration Cooperative Urological Research Group (VACURG). As the authors provided the data from the second study, that was the one I am going with.
+
+In this trial, the study patients were enrolled between 1960 and 1967 and were randomly assigned one of
+two treatments. Treatment A is a treatment by radical prostatectomy and oestrogen, and treatment B was prostatectomy followed by daily oral placebo. The researchers admitted a total of 89 patients. At the end of the study, 27 were still alive.
+
+This data is saved as an MS Excel file called "VacurgData.xlsx" with four relevant columns:
+
+`entry time (months)` is the entry time in months after 1960
+
+`survival time or time to loss to follow-up (months)` is self-explanatory
+
+`censored` is the indicator variable for censoring with the following values: 0 for event and 1 for censored data
+
+`Group` is the treatment group
+
+We first load all the R-packages relevant to this analysis.
+
+```{r, results='hide', warning=FALSE, message=FALSE}
+library(survival)
+library(readxl)
+library(Hmisc)
+library(survminer)
+library(boot)
+```
+
+Then we load the Excel file.
+
+```{r}
+vacurg = read_xlsx("VacurgData.xlsx",col_names = T)
+#head(vacurg)
+```
+
+Unfortunately, the variables imported from the Excel file does not fit some of the R functions that we will be using. For example, the function `Surv` in R prefers the value 1 for event and 0 for censored data. Thus, we generate more suitable variables and labelling.
+
+```{r}
+forlabel = names(vacurg)
+names(vacurg) = c("no","entrytime","time","censored","treatment")
+label(vacurg,self=F)=forlabel
+vacurg$status = as.numeric(!(vacurg$censored))
+vacurg$censored = factor(vacurg$censored,levels=c(0,1),labels=c("No","Yes"))
+vacurg$trtind = ifelse(vacurg$treatment=="B",0,1)
+```
+
+In this new table, the column `status` is the indicator variable for event (i.e. 1 for event and 0 for censored data) while the column `trtind` is the indicator variable for treatment (i.e. 1 for treatment A and 0 for treatment B).
+
+We also split the data into two subsets; one subset for one treatment.
+
+```{r}
+vacurgA = vacurg[vacurg$treatment=="A",]
+vacurgB = vacurg[vacurg$treatment=="B",]
+```
+
+We calculated some summary statistics of this data.
+
+```{r}
+sizegroupA = sum(vacurg$treatment=="A")
+sizegroupA
+sizegroupB = sum(vacurg$treatment=="B")
+sizegroupB
+totalsize = sizegroupA+sizegroupB
+median(vacurg$time[vacurg$treatment=="A"])/12
+median(vacurg$time[vacurg$treatment=="B"])/12
+```
+
+We can see that there were 43 patients treated with treatment A and 46 patients associated with treatment B. The median time were 5.7 years for treatment A and 9.2 for treatment B.
+
+The survival (Kaplan-Meier) curves for these two groups are as follows:
+
+```{r}
+km_trt_fit = survfit(Surv(time,status) ~ treatment,data=vacurg)
+ggsurvplot(km_trt_fit)
+```
+
+The authors reported that Gehan test gives a one-sided p-value of 0.021. As the median survival time and the Kaplan-Meier suggested, treatment B was the better treatment in this study. The reported p-value supported this hypothesis.
+
+The function `survdiff` in R implements Peto & Peto modification of the Gehan test if we specify `rho=1`. However, it would produce a different p-value from the one reported in the paper.
+
+```{r}
+survdiff(Surv(time,status) ~ treatment,data=vacurg,rho=1)
+```
+
+The test performed by `survdiff` is a chi-square test that corresponds to a two-sided Gehan test using the standard normal distribution. Because of the difference in hypothesis tested as well as the difference in the exact statistic used, the p-value and the statistical powers reported will not be the same as the ones reported by the authors.
+
+## Simulations and Analysis
+
+Before going through the various simulations, let me make a short disclaimer. All of the following simulations are conducted under my interpretations of what the authors described. This means these simulations might not be exactly the same as what they performed. For example, the authors mentioned that their time-points are located at the 3rd, 4th, 5th, and 6th year. I interpret this to be 36, 48, 60, and 72 months after the study started. Of course, another interpretation could be the 25th, 37th, 49th, and 61st month instead, but this is not what I am going with. Another ambiguity is on how the authors described the updating probability using the tuning parameter $r$. The authors only gave one example of updating: i.e. from $0.5$ to $0.5+G \times r$. It is unclear if in the next time point we should update the probability using the rule $p_{\text{new}}=p_{\text{old}}+G \times r$ or as $0.5+G \times r$. I choose to go with the first interpretation, but the second interpretation is just as likely. There are some more examples where I took the freedom in interpreting what was not clearly outlined, so please read the rest of this report with that in mind.
+
+We will perform five simulations described in the paper with the same parameters. These simulations are: Simple Randomisation, MS(r=0.10), MS(r=0.15), Multi-stage RPW(1,1,1), and Multi-stage RPW(4,1,1). We save the results of these simulations in the following two variables. The `meansamplesize` variable will save the average sample size for both treatments across various simulations, while `statpower` will keep track of the statistical power of these designs. The variable `simuln` is the number of simulation. The summary of these two variables is available at the end of this report.
+
+```{r}
+simuln = 1000 #number of simulations
+meansamplesize = matrix(0,nrow=5,ncol=2)
+statpower = rep(0,5)
+```
+
+
+
+All the randomisation probability updating will be done in 36, 48, 60, and 72 months after the study commenced in 1960.
+
+### Data Sorting
+
+To simulate patients admission, we first order the time of admission.
+
+```{r}
+vacurg_sorted = vacurg[order(vacurg$time,vacurg$censored),]
+entrytime = vacurg$entrytime[order(vacurg$entrytime)]
+#Finding which patient is recruited when the probability is updated
+index = apply( outer(c(36,48,60,72), entrytime, ">"), 1, sum)+1
+```
+
+### Simple Randomisation
+
+While the authors compared Play The Winner designs with block randomisation, typically simple randomisation would not have a much lower statistical power for a sample size of 89. Therefore, to simplify the analysis, I simulate using simple randomisation instead.
+
+We will initialise some objects for every design. These objects are:
+
+`samplesize` is a matrix that will keep track of the sample size for both treatments over different iteration of the simulation.
+
+`logranktestresult` keeps track of how many of these simulations give statistically significant results. The average of this vector will be our approximation of statistical power.
+
+
+```{r}
+# Initialising objects for simulations
+samplesize = matrix(0,nrow=simuln,ncol=2)
+names(samplesize) = c("A","B")
+logranktestresult = seq(0,0,length.out = simuln)
+```
+
+Our approach for doing this bootstrap is quite simple. At each time of admission, we admit a simulated patient into the study. We generate a random number between 0 and 1. If this number is less than 0.5, we assign treatment A to the simulated patient. Otherwise, we assign treatment B. If we assign treatment A, then we sample survival time or time to loss of follow up based on the treatment. After we get 89 simulated patients (the same number as the study), we do a hypothesis testing and save the result in logranktestresult as 1 if statistically significant and 0 otherwise.
+
+```{r}
+for(i in 1:simuln){
+  a=0 #variable to keep track of sample size in both groups
+  b=0
+  simdat = matrix(0,nrow=totalsize,ncol=4) # variable to keep track of simulated data for testing
+  simdat = data.frame(simdat)
+  simdat[,1] = entrytime # filling in the first column with time of admission
+  names(simdat) = c("entrytime","time","status","trtind")
+  for(j in 1:totalsize){
+    randnum = runif(1)
+    if(randnum<0.5){
+      a = a+1
+      simdat[j,4] = 1 # Assigning treatment A
+      simdat[j,c(2,3)] = vacurgA[sample.int(sizegroupA,1,replace=T),c(3,6)] #sampling from survival data of treatment A
+    } else {
+      b=b+1
+      simdat[j,4] = 0 # Assigning treatment B
+      simdat[j,c(2,3)] = vacurgB[sample.int(sizegroupB,1,replace=T),c(3,6)] #sampling from survival data of treatment A
+    }
+  }
+  logranktestresult[i] = (survdiff(Surv(time,status)~trtind,data=simdat,rho=1)$chisq>qchisq(0.95,1)) #hypothesis test
+  samplesize[i,]=c(a,b)
+}
+
+samplesize1 = samplesize[,1] #saving the samplesize for plotting frequency distribution
+samplesize1 = cbind(samplesize1,rep(1,simuln))
+
+meansamplesize[1,] = apply(samplesize,2,mean) #calculating the average sample size across the iterations
+meansamplesize[1,]
+
+# Estimating the power by calculating the proportion of significant results
+statpower[1] = mean(logranktestresult)
+statpower[1]
+```
+
+The last two printed results reported the average sample size of both treatments and the estimated statistical power. The average sample size suggested that I assign the treatments correctly. However, this does not mean that I sampled from the survival curves correctly. To test if my bootstrap implementation is correct, I compare our result with the bootstrap carried out by the censboot function that performs bootstrap on censored data. While the numbers should not be equal because censboot sampled from the whole dataset (that is, with proportions of 43:46 instead of 1:1), the result should be close. 
+
+```{r}
+# Defining function to do Gehan test: outputs 1 if significant and 0 otherwise
+fun <- function(data) {
+out = (survdiff(Surv(time,status)~trtind,data=data,rho=1)$chisq>qchisq(0.95,1))
+}
+
+# Applying the above function to 1000 bootstrap simulations
+pow = censboot(vacurg,fun,R=1000)
+
+# Estimating the power by calculating the proportion of significant results
+mean(pow$t)
+```
+
+It appears that the results are indeed close.
+
+### Multi-stage r=0.10
+
+This simulation is a little trickier because we have to recalculate the assignment probability at the specified time points (36,48,60,72 months). Our approach is as follows: Up to the first time point (36), do simple randomisation. Then, for every patient that will have their event occur after 36 months, we declare them to be censored at 36 months by changing the value of 3 variables tempstatus, temptime, and temptotaltime. Then we calculate the Peto statistic and use it to update the assignment probability `newp`. We report average sample sizes and statistical power at the end.
+
+Caveat: I converted the Peto (chi-square) statistic produced by `survdiff` into a normal random variable and use it as G in updating the probability. But this is not how G should work. How it is supposed to work is: if treatment B works better then probability of getting treatment B would be higher and vice versa. How our G work is:  if the treatments are different enough then the simulation will favour B but otherwise it might favour A. Most of the times, this would result in favouring the same treatment (i.e. treatment B) but as we will see in the frequency distribution, this will create a heavy tail favouring A too. Unfortunately, all the statistics comparing two survival curves in R that I know uses chi square statistic. So until I can found R function that produces z-stat comparing two survival curves or code my own test, I am afraid this is the best I can do. 
+
+```{r}
+# Initializing objects for simulations
+samplesize = matrix(0,nrow=simuln,ncol=2)
+names(samplesize) = c("A","B")
+logranktestresult = seq(0,0,length.out = simuln)
+
+
+for(i in 1:simuln){
+  a=0 #variable to keep track of sample size in both groups
+  b=0
+  newp = 0.5
+  simdat = matrix(0,nrow=totalsize,ncol=8) # variable to keep track of simulated data for testing
+  simdat = data.frame(simdat)
+  simdat[,1] = entrytime # filling in the first column with time of admission
+  names(simdat) = c("entrytime","time","status","trtind","totaltime","temptime","tempstatus","temptotaltime")
+  randvec = runif(totalsize)
+  for(j in 1:totalsize){
+    if(randvec[j]<newp){
+      a = a+1
+      simdat[j,4] = 1 # Assigning treatment A
+      simdat[j,c(2,3)] = vacurgA[sample.int(sizegroupA,1,replace=T),c(3,6)] #sampling from survival data of treatment A
+      
+    } else {
+      b=b+1
+      simdat[j,4] = 0 # Assigning treatment B
+      simdat[j,c(2,3)] = vacurgB[sample.int(sizegroupB,1,replace=T),c(3,6)] #sampling from survival data of treatment B
+    }
+    #calculating entrytime + time to see if event happens before the specified time point
+    simdat[j,5] = simdat[j,1]+simdat[j,2] 
+    if(j %in% index){
+      #calculating G-stat
+      simdat$tempstatus = ifelse(simdat$totaltime>simdat$totaltime[j],simdat$tempstatus,1)
+      simdat$temptime = ifelse(simdat$totaltime>simdat$totaltime[j],simdat$totaltime[j]-simdat$entrytime,simdat$time)
+      simdat$temptotaltime = ifelse(simdat$totaltime>simdat$totaltime[j],simdat$totaltime[j],simdat$totaltime)
+      G = qnorm(pchisq(survdiff(Surv(temptime,tempstatus)~trtind,data=
+                                  simdat[simdat$temptotaltime<=simdat$totaltime[j]&simdat$temptotaltime>0,],rho=1)$chisq,1)) 
+      # Recalculating assignment probability
+      newp = newp-0.1*G
+      newp = ifelse(newp>0.9,0.9,newp)
+      newp = ifelse(newp<0.1,0.1,newp)
+    }
+  }
+  logranktestresult[i] = (survdiff(Surv(time,status)~trtind,data=simdat,rho=1)$chisq>qchisq(0.95,1)) #hypothesis test
+  samplesize[i,]=c(a,b)
+}
+
+samplesize2 = samplesize[,1] #saving the samplesize for plotting frequency distribution
+samplesize2 = cbind(samplesize2,rep(2,simuln))
+
+meansamplesize[2,] = apply(samplesize,2,mean) #calculating the average sample size across the iterations
+meansamplesize[2,]
+
+# Estimating the power by calculating the proportion of significant results
+statpower[2] = mean(logranktestresult)
+statpower[2]
+```
+
+
+### Multi-stage r=0.15
+
+The same simulation as above. The only difference is the formula to calculate the updated assignment probability `newp` using the tuning parameter r=0.15 instead of 0.10
+
+<style>
+div.hidecode + pre {display: none}
+</style>
+<script>
+doclick=function(e){
+e.nextSibling.nextSibling.style.display="block";
+}
+</script>
+
+<div class="hidecode" onclick="doclick(this);">[Show Code]</div>
+```{r}
+# Initializing objects for simulations
+samplesize = matrix(0,nrow=simuln,ncol=2)
+names(samplesize) = c("A","B")
+logranktestresult = seq(0,0,length.out = simuln)
+
+
+for(i in 1:simuln){
+  a=0 #variable to keep track of sample size in both groups
+  b=0
+  newp = 0.5
+  simdat = matrix(0,nrow=totalsize,ncol=8) # variable to keep track of simulated data for testing
+  simdat = data.frame(simdat)
+  simdat[,1] = entrytime # filling in the first column with time of admission
+  names(simdat) = c("entrytime","time","status","trtind","totaltime","temptime","tempstatus","temptotaltime")
+  randvec = runif(totalsize)
+  for(j in 1:totalsize){
+    if(randvec[j]<newp){
+      a = a+1
+      simdat[j,4] = 1 # Assigning treatment A
+      simdat[j,c(2,3)] = vacurgA[sample.int(sizegroupA,1,replace=T),c(3,6)] #sampling from survival data of treatment A
+      
+    } else {
+      b=b+1
+      simdat[j,4] = 0 # Assigning treatment B
+      simdat[j,c(2,3)] = vacurgB[sample.int(sizegroupB,1,replace=T),c(3,6)] #sampling from survival data of treatment B
+    }
+    #calculating entrytime + time to see if event happens before the specified time point
+    simdat[j,5] = simdat[j,1]+simdat[j,2] 
+    if(j %in% index){
+      #calculating G-stat
+      simdat$tempstatus = ifelse(simdat$totaltime>simdat$totaltime[j],simdat$tempstatus,1)
+      simdat$temptime = ifelse(simdat$totaltime>simdat$totaltime[j],simdat$totaltime[j]-simdat$entrytime,simdat$time)
+      simdat$temptotaltime = ifelse(simdat$totaltime>simdat$totaltime[j],simdat$totaltime[j],simdat$totaltime)
+      G = qnorm(pchisq(survdiff(Surv(temptime,tempstatus)~trtind,data=
+                                  simdat[simdat$temptotaltime<=simdat$totaltime[j]&simdat$temptotaltime>0,],rho=1)$chisq,1)) 
+      # Recalculating assignment probability
+      newp = newp-0.15*G
+      newp = ifelse(newp>0.9,0.9,newp)
+      newp = ifelse(newp<0.1,0.1,newp)
+    }
+  }
+  logranktestresult[i] = (survdiff(Surv(time,status)~trtind,data=simdat,rho=1)$chisq>qchisq(0.95,1)) #hypothesis test
+  samplesize[i,]=c(a,b)
+}
+
+samplesize3 = samplesize[,1] #saving the samplesize for plotting frequency distribution
+samplesize3 = cbind(samplesize3,rep(3,simuln))
+```
+
+```{r}
+meansamplesize[3,] = apply(samplesize,2,mean) #calculating the average sample size across the iterations
+meansamplesize[3,]
+
+# Estimating the power by calculating the proportion of significant results
+statpower[3] = mean(logranktestresult)
+statpower[3]
+```
+
+### Multistage RPW(1,1,1)
+
+This simulation method uses the urn model discussed earlier. Success is not obvious to define for this study while failure is defined as the event of death. The urn is updated at 36, 48, 60, and 72 months.
+
+```{r}
+# Initializing objects for simulations
+samplesize = matrix(0,nrow=simuln,ncol=2)
+names(samplesize) = c("A","B")
+logranktestresult = seq(0,0,length.out = simuln)
+
+
+for(i in 1:simuln){
+  a=0 #variable to keep track of sample size in both groups
+  b=0
+  failA = NULL # the number of failures on each stage
+  failB= NULL
+  ballA = 1 # Initial number of balls in the urn
+  ballB = 1
+  simdat = matrix(0,nrow=totalsize,ncol=5) # variable to keep track of simulated data for testing
+  simdat = data.frame(simdat)
+  simdat[,1] = entrytime # filling in the first column with time of admission
+  names(simdat) = c("entrytime","time","status","trtind","totaltime")
+  for(j in 1:totalsize){
+    randnum = sample.int(ballA+ballB,1,replace = T)
+    if(randnum<=ballA){
+      a = a+1
+      simdat[j,4] = 1 # Assigning treatment A
+      simdat[j,c(2,3)] = vacurgA[sample.int(sizegroupA,1,replace=T),c(3,6)] #sampling from survival data of treatment A
+      
+    } else {
+      b=b+1
+      simdat[j,4] = 0 # Assigning treatment B
+      simdat[j,c(2,3)] = vacurgB[sample.int(sizegroupB,1,replace=T),c(3,6)] #sampling from survival data of treatment B
+    }
+    simdat[j,5] = simdat[j,1]+simdat[j,2] #calculating entrytime + time to see if event happens before the specified time point
+    
+    # Recalculating assignment probability
+    if(j ==index[1]){
+      #calculating failure from the start to the first time point
+      failB=sum(simdat$totaltime<simdat$totaltime[j] & simdat$status == 1 & simdat$trtind == 0) 
+      failA=sum(simdat$totaltime<simdat$totaltime[j] & simdat$status == 1 & simdat$trtind == 1)
+      # Updating the number of balls in the urn
+      ballA = ballA+failB
+      ballB = ballB+failA
+    }
+    if(j %in% index[c(2,3,4)]){
+      #calculating failure from the previous time point  to the current time point
+      failB=sum(simdat$totaltime<simdat$totaltime[j] & simdat$totaltime>=simdat$totaltime[j]-12 
+                & simdat$status == 1 & simdat$trtind == 0)
+      failA=sum(simdat$totaltime<simdat$totaltime[j] & simdat$totaltime>=simdat$totaltime[j]-12 
+                & simdat$status == 1 & simdat$trtind == 1)
+      # Updating the number of balls in the urn
+      ballA = ballA+failB
+      ballB = ballB+failA
+    }
+  }
+  logranktestresult[i] = (survdiff(Surv(time,status)~trtind,data=simdat,rho=1)$chisq>qchisq(0.95,1)) #hypothesis test
+  samplesize[i,]=c(a,b)
+}
+
+samplesize4 = samplesize[,1] #saving the samplesize for plotting frequency distribution
+samplesize4 = cbind(samplesize4,rep(4,simuln))
+
+meansamplesize[4,] = apply(samplesize,2,mean) #calculating the average sample size across the iterations
+meansamplesize[4,]
+
+# Estimating the power by calculating the proportion of significant results
+statpower[4] = mean(logranktestresult)
+statpower[4]
+```
+
+### Multistage RPW(4,1,1)
+
+This simulation method is the same as the previous one with the exception of starting with 4 balls marked A and 4 balls marked B instead of one of each.
+
+<style>
+div.hidecode + pre {display: none}
+</style>
+<script>
+doclick=function(e){
+e.nextSibling.nextSibling.style.display="block";
+}
+</script>
+
+<div class="hidecode" onclick="doclick(this);">[Show Code]</div>
+```{r}
+# Initializing objects for simulations
+samplesize = matrix(0,nrow=simuln,ncol=2)
+names(samplesize) = c("A","B")
+logranktestresult = seq(0,0,length.out = simuln)
+
+
+for(i in 1:simuln){
+  a=0 #variable to keep track of sample size in both groups
+  b=0
+  failA = NULL # the number of failures on each stage
+  failB= NULL
+  ballA = 4 # Initial number of balls in the urn
+  ballB = 4
+  simdat = matrix(0,nrow=totalsize,ncol=5) # variable to keep track of simulated data for testing
+  simdat = data.frame(simdat)
+  simdat[,1] = entrytime # filling in the first column with time of admission
+  names(simdat) = c("entrytime","time","status","trtind","totaltime")
+  for(j in 1:totalsize){
+    randnum = sample.int(ballA+ballB,1,replace = T)
+    if(randnum<=ballA){
+      a = a+1
+      simdat[j,4] = 1 # Assigning treatment A
+      simdat[j,c(2,3)] = vacurgA[sample.int(sizegroupA,1,replace=T),c(3,6)] #sampling from survival data of treatment A
+      
+    } else {
+      b=b+1
+      simdat[j,4] = 0 # Assigning treatment B
+      simdat[j,c(2,3)] = vacurgB[sample.int(sizegroupB,1,replace=T),c(3,6)] #sampling from survival data of treatment B
+    }
+    simdat[j,5] = simdat[j,1]+simdat[j,2] #calculating entrytime + time to see if event happens before the specified time point
+    
+    # Recalculating assignment probability
+    if(j ==index[1]){
+      #calculating failure from the start to the first time point
+      failB=sum(simdat$totaltime<simdat$totaltime[j] & simdat$status == 1 & simdat$trtind == 0) 
+      failA=sum(simdat$totaltime<simdat$totaltime[j] & simdat$status == 1 & simdat$trtind == 1)
+      # Updating the number of balls in the urn
+      ballA = ballA+failB
+      ballB = ballB+failA
+    }
+    if(j %in% index[c(2,3,4)]){
+      #calculating failure from the previous time point  to the current time point
+      failB=sum(simdat$totaltime<simdat$totaltime[j] & simdat$totaltime>=simdat$totaltime[j]-12 
+                & simdat$status == 1 & simdat$trtind == 0)
+      failA=sum(simdat$totaltime<simdat$totaltime[j] & simdat$totaltime>=simdat$totaltime[j]-12 
+                & simdat$status == 1 & simdat$trtind == 1)
+      # Updating the number of balls in the urn
+      ballA = ballA+failB
+      ballB = ballB+failA
+    }
+  }
+  logranktestresult[i] = (survdiff(Surv(time,status)~trtind,data=simdat,rho=1)$chisq>qchisq(0.95,1)) #hypothesis test
+  samplesize[i,]=c(a,b)
+}
+
+samplesize5 = samplesize[,1] #saving the samplesize for plotting frequency distribution
+samplesize5 = cbind(samplesize5,rep(5,simuln))
+```
+
+```{r}
+meansamplesize[5,] = apply(samplesize,2,mean) #calculating the average sample size across the iterations
+meansamplesize[5,]
+
+# Estimating the power by calculating the proportion of significant results
+statpower[5] = mean(logranktestresult)
+statpower[5]
+```
+
+### Frequency distributions of number of patients in treatment A
+
+We compare the frequency distributions of number of patients in treatment A (worse treatment) using simple randomisation vs Multi-stage with tuning parameter r.
+
+```{r}
+plotdata1 = data.frame(rbind(samplesize1,samplesize2))
+names(plotdata1) = c("samplesize","method")
+plotdata1$method = factor(plotdata1$method,levels = c(1,2,3), labels=c("Simple Randomisation","MS(r=0.10)","MS(r=0.15)"))
+densplot1 = ggplot(plotdata1, aes(x=samplesize, color=method)) +
+  geom_density()+labs(x="# of patients with treatment A",title = "Distribution of sample size of simple randomisation vs MS(r=0.10)")
+densplot1
+```
+
+```{r}
+plotdata2 = data.frame(rbind(samplesize1,samplesize3))
+names(plotdata2) = c("samplesize","method")
+plotdata2$method = factor(plotdata2$method,levels = c(1,2,3), labels=c("Simple Randomisation","MS(r=0.10)","MS(r=0.15)"))
+densplot2 = ggplot(plotdata2, aes(x=samplesize, color=method)) +
+  geom_density()+labs(x="# of patients with treatment A",title = "Distribution of sample size of simple randomisation vs MS(r=0.15)")
+densplot2
+```
+
+```{r}
+plotdata4 = data.frame(rbind(samplesize1,samplesize4))
+names(plotdata4) = c("samplesize","method")
+plotdata4$method = factor(plotdata4$method,levels = c(1,4,5), labels=c("Simple Randomisation","RPW(1,1,1)","RPW(4,1,1)"))
+densplot4 = ggplot(plotdata4, aes(x=samplesize, color=method)) +
+  geom_density()+labs(x="# of patients with treatment A",title = "Distribution of sample size of simple randomisation vs RPW(1,1,1)")
+densplot4
+```
+
+```{r}
+plotdata5 = data.frame(rbind(samplesize1,samplesize5))
+names(plotdata5) = c("samplesize","method")
+plotdata5$method = factor(plotdata5$method,levels = c(1,4,5), labels=c("Simple Randomisation","RPW(1,1,1)","RPW(4,1,1)"))
+densplot5 = ggplot(plotdata5, aes(x=samplesize, color=method)) +
+  geom_density()+labs(x="# of patients with treatment A",title = "Distribution of sample size of simple randomisation vs RPW(4,1,1)")
+densplot5
+```
+
+## Summary - Sample Size & Statistical Power Table
+
+We summarise the results of the five bootstrap simulations in the following table
+
+```{r}
+summarytable = cbind(c("Simple Randomisation","MS(r=0.10)","MS(r=0.15)","RPW(1,1,1)","RPW(4,1,1)"),
+                       round(meansamplesize),statpower)
+summarytable = data.frame(summarytable)
+names(summarytable) = c("Design","Sample Size Treatment A", "Sample Size Treatment B", "Power")
+summarytable
+```
+
+
+### Conclusions
+
+
+While my numbers are different with the ones reported in the papers, I found the same conclusion with the authors. My simulations suggest that Play The Winner design can significantly increase the number of patients treated with the better treatment without losing much statistical power. I also found that the Multi-stage with tuning parameter put more people in the better arm of the study compared to RPW designs.
+
+
+### Further Works
+
+We can observe major similarities in the codes used for the five types of simulations. A clear potential improvement is to combine the codes of these various simulations types into one function where we can specify the number of simulations, source data, type of simulations, time-points of probability update, etc. This rewriting would significantly improve the readability of the codes. Once this is done, it would also be straightforward to apply this function to other datasets to see if the conclusions are robust enough across various clinical trials.
